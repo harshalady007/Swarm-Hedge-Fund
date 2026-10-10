@@ -1,0 +1,17 @@
+# local state: the journal holds your track record and must not be committed
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+# secrets
+.env
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# caches and scratch
+.cache/
+*.log

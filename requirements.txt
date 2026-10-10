@@ -1,0 +1,8 @@
+# All free and open source. Python 3.11+.
+yfinance>=0.2.50       # Yahoo Finance prices, fundamentals, quarterly statements
+anthropic>=1.13        # Claude API (only used when ANTHROPIC_API_KEY is set)
+requests>=2.31         # Telegram, Google News RSS, Jina Reader, PDF downloads
+pandas>=2.1
+numpy>=1.26
+feedparser>=6.0        # Google News RSS parsing
+pytest>=8.0            # tests
