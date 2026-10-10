@@ -15,6 +15,8 @@ def checks(ctx, sym):
     yield "yahoo prices", lambda: _prices(ctx, [sym, config.BENCHMARK, config.VIX])
     yield "yahoo fundamentals", lambda: data.fundamentals(ctx, sym)
     yield "google news rss", lambda: data.headlines(ctx, sym)
+    yield "yahoo quarterly results", lambda: data.quarterly(ctx, sym)
+    yield "yahoo sector indices", lambda: _sector_indices(ctx)
     yield "telegram (config only)", _telegram
     yield "anthropic key (config)", _anthropic
 
@@ -26,6 +28,17 @@ def _prices(ctx, tickers):
     if missing:
         return {"status": "unavailable", "data": None, "error": f"missing {missing}", "rows": rows}
     return {"status": "ok", "rows": rows, "detail": ", ".join(f"{t}:{len(df)}" for t, df in p.items())}
+
+
+def _sector_indices(ctx):
+    import features
+    p = data.load_prices(ctx, config.sector_index_tickers())
+    picks = features.pick_sector_benchmarks(p, ctx.day)
+    usable = [t for t, _ in picks.values() if t]
+    detail = "; ".join(f"{s}: {t or 'basket fallback'}" for s, (t, _) in picks.items())
+    return {"status": "ok" if usable else "unavailable", "rows": len(usable),
+            "detail": f"{len(usable)} usable index(es). {detail}",
+            "error": None if usable else "no Yahoo sector index has usable history; all sectors use baskets"}
 
 
 def _telegram():

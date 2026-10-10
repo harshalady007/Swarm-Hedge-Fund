@@ -33,7 +33,12 @@ def load_prices(ctx, tickers):
     else:
         out = _yahoo_prices(ctx, tickers)
     end = pd.Timestamp(ctx.day)
-    return {t: df[df.index <= end] for t, df in out.items() if df is not None and len(df)}
+    out = {t: df[df.index <= end] for t, df in out.items() if df is not None and len(df)}
+    if ctx.offline:
+        for t in config.sector_index_tickers():
+            if t in out and t not in FAKE_INDEX_WITH_HISTORY:
+                out[t] = out[t].iloc[-1:]
+    return out
 
 
 def _yahoo_prices(ctx, tickers):
@@ -109,6 +114,11 @@ def _fake_market_returns():
     return days, drift + rng.normal(0, 0.009, len(days))
 
 
+# Offline sector indices mirror what Yahoo actually served on 2026-10-10: three
+# with history, the rest a single quote row. Both code paths get exercised.
+FAKE_INDEX_WITH_HISTORY = {"^CNXIT", "^NSEBANK", "^CNXPHARMA"}
+
+
 def fake_prices(ticker):
     days, mkt = _fake_market_returns()
     if ticker == config.BENCHMARK:
@@ -174,6 +184,77 @@ def fake_fundamentals(symbol):
             "earnings_growth": round(float(rng.normal(0.10, 0.15)), 3),
             "profit_margin": round(float(rng.uniform(0.04, 0.30)), 3),
             "market_cap": float(rng.uniform(1e12, 2e13))}
+
+
+# ============================================================ quarterly results
+_Q_ROWS = {
+    "revenue": ["Total Revenue", "Operating Revenue"],
+    "operating_profit": ["Operating Income"],
+    "operating_profit_ebit": ["EBIT"],
+    "net_profit": ["Net Income", "Net Income Common Stockholders"],
+    "eps": ["Diluted EPS", "Basic EPS"],
+}
+
+
+def quarterly(ctx, symbol):
+    """Quarterly income statement lines from Yahoo (rupees, EPS in rupees per share)."""
+    def live():
+        import yfinance as yf
+        return quarterly_records(yf.Ticker(config.yahoo_ticker(symbol)).quarterly_income_stmt)
+    return get_dataset(ctx, "quarterly", symbol, live, lambda: fake_quarterly(symbol, ctx.day))
+
+
+def quarterly_records(stmt):
+    """DataFrame (rows = line items, columns = period ends) -> list of dicts, oldest first."""
+    if stmt is None or stmt.empty:
+        return []
+
+    def pick(names, col):
+        for n in names:
+            if n in stmt.index:
+                v = stmt.loc[n, col]
+                if v is not None and not (isinstance(v, float) and np.isnan(v)) and pd.notna(v):
+                    return float(v)
+        return None
+
+    out = []
+    for col in stmt.columns:
+        rec = {"period_end": pd.Timestamp(col).date().isoformat()}
+        rec["revenue"] = pick(_Q_ROWS["revenue"], col)
+        op = pick(_Q_ROWS["operating_profit"], col)
+        if op is None:
+            op = pick(_Q_ROWS["operating_profit_ebit"], col)
+            rec["operating_profit_basis"] = "EBIT" if op is not None else None
+        rec["operating_profit"] = op
+        rec["net_profit"] = pick(_Q_ROWS["net_profit"], col)
+        rec["eps"] = pick(_Q_ROWS["eps"], col)
+        if any(rec.get(k) is not None for k in ("revenue", "net_profit", "eps")):
+            out.append(rec)
+    return sorted(out, key=lambda r: r["period_end"])
+
+
+def fake_quarterly(symbol, day):
+    rng = np.random.default_rng(seed_for(symbol, "quarters"))
+    ends = [d.date() for d in pd.date_range("2023-03-31", periods=24, freq="QE")]
+    ends = [e for e in ends if e + timedelta(days=45) <= day][-6:]
+    rev = float(rng.uniform(5_000, 60_000)) * 1e7
+    margin = float(rng.uniform(0.10, 0.30))
+    shares = float(rng.uniform(1e9, 6e9))
+    drop = int(rng.integers(0, 4)) if rng.random() < 0.3 else None     # Yahoo often skips a quarter
+    out = []
+    for i, e in enumerate(ends):
+        r2 = np.random.default_rng(seed_for(symbol, e.isoformat()))
+        rev *= 1 + r2.normal(0.03, 0.04)
+        m = margin + r2.normal(0, 0.015)
+        net = rev * m * 0.75
+        rec = {"period_end": e.isoformat(), "revenue": round(rev), "operating_profit": round(rev * m),
+               "net_profit": round(net), "eps": round(net / shares, 2)}
+        if config.UNIVERSE.get(symbol) == "Financials":
+            rec["operating_profit"] = None                          # as Yahoo does for banks
+        if drop is not None and i == drop:
+            continue
+        out.append(rec)
+    return out
 
 
 # ==================================================================== headlines

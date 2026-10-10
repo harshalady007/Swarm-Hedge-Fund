@@ -37,7 +37,12 @@ VIX = "^INDIAVIX"            # India VIX on Yahoo
 
 
 def yahoo_ticker(symbol: str) -> str:
-    return symbol if symbol.startswith("^") else f"{symbol}.NS"
+    """NSE stocks need ".NS"; indices (^...) and full Yahoo tickers (X.NS) pass through."""
+    return symbol if symbol.startswith("^") or "." in symbol else f"{symbol}.NS"
+
+
+def sector_index_tickers():
+    return sorted({t for ts in SECTOR_INDEX_CANDIDATES.values() for t in ts})
 
 
 # Yahoo sector index candidates, tried in order. Each is checked at runtime for

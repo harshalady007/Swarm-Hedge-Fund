@@ -405,7 +405,8 @@ def run_swarm(sym, sector, held, briefs, llm: LLM, manager_extra_fn=None):
         io.append({"agent": side, "model": model, "input_text": deb_text, "output": out, "error": err})
 
     extra = manager_extra_fn() if manager_extra_fn else {}
-    m_brief = briefing.manager(sym, sector, day, ind, held, reports, debate["bull"], debate["bear"], extra)
+    m_brief = briefing.fit(briefing.manager(sym, sector, day, ind, held, reports, debate["bull"],
+                                            debate["bear"], extra))
     m_text = briefing.render(m_brief)
     if use_llm:
         obj, err = llm.json_call(config.MANAGER_MODEL, f"{COMMON}\n\n{MANAGER}\n\n{MANAGER_TASK}", m_text,

@@ -252,6 +252,63 @@ def finish_run(con, day, data_mode, agent_mode, n_reviewed, n_buy, n_sell, note=
     con.commit()
 
 
+# ------------------------------------------------------- manager context
+def portfolio_context(con, prices, day):
+    """Open positions with unrealised P&L, sector exposure and cash share of equity."""
+    m = mark(con, prices, day)
+    eq = m["equity"] or 1.0
+    positions, exposure = [], {}
+    for p in open_positions(con):
+        px = last_close(prices, p["symbol"], day) or p["entry_price"]
+        value = p["qty"] * px
+        exposure[p["sector"]] = exposure.get(p["sector"], 0.0) + value
+        positions.append({"symbol": p["symbol"], "sector": p["sector"], "qty": p["qty"],
+                          "entry_day": p["entry_day"], "entry_price": round(p["entry_price"], 2),
+                          "last_close": round(px, 2), "unrealised_pct": round((px / p["entry_price"] - 1) * 100, 2),
+                          "unrealised_rupees": round(value - p["entry_cash"]),
+                          "weight_pct": round(value / eq * 100, 1),
+                          "stop": round(p["stop"], 2), "target": round(p["target"], 2)})
+    pend = [{"symbol": o["symbol"], "side": o["side"], "created_day": o["created_day"]} for o in pending_orders(con)]
+    return {"equity_rupees": round(eq), "free_cash_pct": round((m["cash"] - m["reserved"]) / eq * 100, 1),
+            "reserved_for_pending_pct": round(m["reserved"] / eq * 100, 1),
+            "open_positions": positions, "open_position_count": len(positions),
+            "sector_exposure_pct": {k: round(v / eq * 100, 1) for k, v in sorted(exposure.items())},
+            "pending_orders": pend,
+            "limits": {"max_positions": config.MAX_POSITIONS, "max_per_sector": config.MAX_PER_SECTOR}}
+
+
+def prior_calls(con, prices, day, symbol, n=None):
+    """The manager's earlier calls on this stock and what happened afterwards."""
+    n = n or config.PRIOR_CALLS_SHOWN
+    rows = con.execute("SELECT * FROM signals WHERE symbol=? AND trading_day<? ORDER BY trading_day DESC LIMIT ?",
+                       (symbol, day, n)).fetchall()
+    now = last_close(prices, symbol, day)
+    out = []
+    for s in reversed(rows):
+        rec = {"day": s["trading_day"], "action": s["action"], "confidence": s["confidence"],
+               "status": s["status"], "close_then": round(s["close"], 2) if s["close"] else None,
+               "move_since_pct": round((now / s["close"] - 1) * 100, 2) if now and s["close"] else None}
+        o = con.execute("SELECT * FROM orders WHERE signal_id=?", (s["id"],)).fetchone()
+        if o is not None and o["side"] == "BUY":
+            p = con.execute("SELECT * FROM positions WHERE order_id=?", (o["id"],)).fetchone()
+            if p is None:
+                rec["trade"] = f"order {o['status'].lower()}" + (f" ({o['note']})" if o["note"] else "")
+            elif p["status"] == "OPEN":
+                rec["trade"] = f"filled {p['entry_day']} at {p['entry_price']:.2f}, still open"
+            else:
+                rec["trade"] = (f"filled {p['entry_day']}, exited {p['exit_day']} by {p['exit_reason']}, "
+                                f"{p['pnl'] / p['entry_cash'] * 100:+.2f}%")
+        out.append(rec)
+    return out
+
+
+def recent_closed(con, n=None):
+    n = n or config.TRACK_RECORD_CLOSED_TRADES
+    rows = con.execute("SELECT * FROM positions WHERE status='CLOSED' ORDER BY exit_day DESC, id DESC LIMIT ?",
+                       (n,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 # --------------------------------------------------------------- reporting
 def trade_stats(closed):
     """Win rate and average win/loss in percent of the cash put in."""

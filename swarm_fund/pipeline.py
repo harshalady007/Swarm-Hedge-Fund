@@ -11,6 +11,7 @@ import briefing
 import config
 import data
 import db
+import features
 import indicators
 import journal
 import notify
@@ -42,7 +43,7 @@ def run(db_path, offline=False, asof=None, llm=None, quiet=False):
         banner("OFFLINE MODE: all market data below is synthetic.")
 
     # 1. prices
-    tickers = list(config.UNIVERSE) + [config.BENCHMARK, config.VIX]
+    tickers = list(config.UNIVERSE) + [config.BENCHMARK, config.VIX] + config.sector_index_tickers()
     prices = data.load_prices(ctx, tickers)
     if not offline and not asof:
         prices, dropped = data.drop_partial_today(prices)
@@ -76,6 +77,8 @@ def run(db_path, offline=False, asof=None, llm=None, quiet=False):
 
     # 4-6. market context, indicators, screen
     market = indicators.market_context(nifty, prices.get(config.VIX))
+    benchmarks = features.pick_sector_benchmarks(prices, day)
+    print("Sector benchmarks: " + "; ".join(f"{s}={t or 'basket'}" for s, (t, _) in benchmarks.items()))
     inds, scores = {}, {}
     for sym in config.UNIVERSE:
         df = prices.get(sym)
@@ -102,9 +105,9 @@ def run(db_path, offline=False, asof=None, llm=None, quiet=False):
         sector = config.UNIVERSE[sym]
         is_held = sym in held
         ds = gather(ctx, sym)
-        briefs = build_briefs(ctx, sym, sector, inds[sym], scores[sym], market, ds)
+        briefs = build_briefs(ctx, sym, sector, inds[sym], scores[sym], market, ds, prices, benchmarks)
         res = agents.run_swarm(sym, sector, is_held, briefs, llm,
-                               manager_extra_fn=lambda s=sym: manager_extra(ctx, s, prices, m))
+                               manager_extra_fn=lambda s=sym, d=ds: manager_extra(ctx, s, prices, d))
         res["datasets"] = ds
         results.append(res)
         if not quiet:
@@ -172,29 +175,53 @@ def gather(ctx, sym):
     """Fetch every per-stock dataset. Only called for shortlisted and held stocks."""
     return {
         "fundamentals": data.fundamentals(ctx, sym),
+        "quarterly": data.quarterly(ctx, sym),
         "headlines": data.headlines(ctx, sym),
     }
 
 
-def build_briefs(ctx, sym, sector, ind, screen, market, ds):
+def build_briefs(ctx, sym, sector, ind, screen, market, ds, prices, benchmarks):
     T = ctx.day_str
-    return {
-        "technical": briefing.technical(sym, T, ind, screen),
-        "fundamental": briefing.fundamental(sym, T, ds["fundamentals"]),
+    df = prices[sym]
+
+    # technical: indicators + the price series itself
+    tech_extra = {"daily_bars": features.compact_bars(df), "weekly_closes": features.weekly_closes(df)}
+
+    # fundamental: snapshot + quarterly trend
+    fund_extra, fund_gaps = {}, []
+    q = ds["quarterly"]
+    if q["status"] == "ok":
+        table, qgaps = features.quarterly_table(q["data"], ctx.day, ctx.is_asof)
+        fund_gaps += qgaps
+        if table:
+            fund_extra["quarterly"] = table
+    else:
+        fund_gaps += briefing.gaps(("quarterly results", q)) or ["quarterly results: Yahoo returned none"]
+
+    # macro: market + sector context
+    sector_ctx, sgaps = features.sector_context(sym, sector, prices, benchmarks, prices[config.BENCHMARK])
+    macro_extra = {"sector_context": sector_ctx}
+
+    briefs = {
+        "technical": briefing.technical(sym, T, ind, screen, tech_extra),
+        "fundamental": briefing.fundamental(sym, T, ds["fundamentals"], fund_extra),
         "news": briefing.news(sym, T, ds["headlines"]),
-        "macro": briefing.macro(sym, sector, T, market),
+        "macro": briefing.macro(sym, sector, T, market, macro_extra),
     }
+    briefs["fundamental"]["data"]["data_gaps"] += fund_gaps
+    briefs["macro"]["data"]["data_gaps"] += sgaps
+    return briefs
 
 
-def manager_extra(ctx, sym, prices, mark):
-    pos = [p for p in journal.open_positions(ctx.con) if p["symbol"] == sym]
-    out = {}
+def manager_extra(ctx, sym, prices, ds):
+    """Portfolio, this stock's history with the desk, and the desk's track record."""
+    con, T = ctx.con, ctx.day_str
+    out = {"portfolio": journal.portfolio_context(con, prices, T),
+           "your_prior_calls_on_this_stock": journal.prior_calls(con, prices, T, sym),
+           "recent_track_record": features.track_record(journal.recent_closed(con))}
+    pos = [p for p in out["portfolio"]["open_positions"] if p["symbol"] == sym]
     if pos:
-        p = pos[0]
-        px = journal.last_close(prices, sym, ctx.day_str)
-        out["position"] = {"qty": p["qty"], "entry_price": round(p["entry_price"], 2), "entry_day": p["entry_day"],
-                           "stop": round(p["stop"], 2), "target": round(p["target"], 2),
-                           "unrealised_pct": round((px / p["entry_price"] - 1) * 100, 2) if px else None}
+        out["this_position"] = pos[0]
     return out
 
 
