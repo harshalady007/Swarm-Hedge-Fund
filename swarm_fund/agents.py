@@ -7,6 +7,7 @@ or a HOLD, and the failure is recorded next to the input in the journal.
 import json
 import math
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import briefing
@@ -97,6 +98,7 @@ SCHEMAS = {
 class LLM:
     """Thin wrapper over the Anthropic SDK. complete() returns raw text or raises;
     tests replace it with a stub."""
+    provider = "anthropic"
 
     def __init__(self, api_key=None):
         api_key = config.ANTHROPIC_API_KEY if api_key is None else api_key
@@ -140,6 +142,101 @@ class LLM:
         if obj is None:
             return None, f"unparseable reply: {raw[:200]!r}"
         return obj, None
+
+
+class SarvamLLM(LLM):
+    """Sarvam AI's chat-completions API (OpenAI-style JSON over HTTPS, no SDK).
+
+    Asks for Structured Outputs (response_format json_schema, strict). If Sarvam
+    rejects that request it retries once in plain JSON mode; the parser copes.
+    Rate limits, overloads and timeouts get one retry with a short backoff.
+    """
+    provider = "sarvam"
+    RETRY_STATUS = (429, 500, 502, 503, 504)
+
+    def __init__(self, api_key=None):
+        self.api_key = config.SARVAM_API_KEY if api_key is None else api_key
+        self.enabled = bool(self.api_key)
+        self.client = None
+
+    def complete(self, model, system, user, schema, max_tokens, effort, fallback=False):
+        body = {"model": model, "max_tokens": max_tokens, "temperature": config.SARVAM_TEMPERATURE,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                "response_format": {"type": "json_schema",
+                                    "json_schema": {"name": "reply", "schema": schema, "strict": True}}}
+        if effort in ("low", "high", "max"):          # medium is Sarvam's default; not sent
+            body["reasoning_effort"] = effort
+        try:
+            data = self._post(body)
+        except _SarvamBadRequest:
+            body["response_format"] = {"type": "json_object"}
+            body["messages"][0] = {"role": "system", "content": system + "\nReply with a single JSON object only."}
+            data = self._post(body)
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError("Sarvam reply had no choices")
+        msg, finish = choices[0].get("message") or {}, choices[0].get("finish_reason")
+        if msg.get("refusal"):
+            raise RuntimeError(f"model declined the request: {str(msg['refusal'])[:200]}")
+        if finish == "content_filter":
+            raise RuntimeError("reply blocked by Sarvam's content filter")
+        text = re.sub(r"<think>.*?</think>", "", msg.get("content") or "", flags=re.S).strip()
+        if finish == "length":
+            raise RuntimeError(f"reply cut off at max_tokens={max_tokens} (reasoning counts toward it)")
+        if not text:
+            raise RuntimeError(f"empty reply (finish_reason={finish})")
+        return text
+
+    def _post(self, body):
+        import requests
+        headers = {"api-subscription-key": self.api_key, "Authorization": f"Bearer {self.api_key}",
+                   "Content-Type": "application/json"}
+        for attempt in (0, 1):
+            try:
+                r = requests.post(config.SARVAM_URL, json=body, headers=headers, timeout=config.LLM_TIMEOUT)
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt == 0:
+                    time.sleep(3)
+                    continue
+                raise RuntimeError(f"Sarvam unreachable: {type(e).__name__}") from e
+            if r.status_code == 200:
+                return r.json()
+            detail = r.text[:300]
+            if r.status_code == 400:
+                raise _SarvamBadRequest(f"HTTP 400: {detail}")
+            if r.status_code in (401, 403):
+                raise RuntimeError(f"Sarvam rejected the API key (HTTP {r.status_code}): {detail}")
+            if r.status_code == 404:
+                raise RuntimeError(f"Sarvam does not know model {body['model']!r} (HTTP 404)")
+            if r.status_code in self.RETRY_STATUS and attempt == 0:
+                time.sleep(min(_retry_after(r), 30))
+                continue
+            raise RuntimeError(f"Sarvam HTTP {r.status_code}: {detail}")
+        raise RuntimeError("Sarvam request failed")      # not reached
+
+
+class _SarvamBadRequest(RuntimeError):
+    pass
+
+
+def _retry_after(resp, default=3.0):
+    try:
+        return max(float(resp.headers.get("Retry-After", default)), 0.0)
+    except (TypeError, ValueError):
+        return default
+
+
+def make_llm(offline=False, provider=None):
+    """The configured LLM client. Offline runs never call a model."""
+    provider = (provider or config.LLM_PROVIDER).lower()
+    if provider not in config.LLM_PROVIDERS:
+        raise ValueError(f"SWARM_LLM_PROVIDER={provider!r} is not one of {', '.join(config.LLM_PROVIDERS)}")
+    cls = SarvamLLM if provider == "sarvam" else LLM
+    return cls(api_key="" if offline else None)
+
+
+def key_name(provider=None):
+    return {"anthropic": "ANTHROPIC_API_KEY", "sarvam": "SARVAM_API_KEY"}[(provider or config.LLM_PROVIDER).lower()]
 
 
 def parse_json(raw):
@@ -427,4 +524,5 @@ def run_swarm(sym, sector, held, briefs, llm: LLM, manager_extra_fn=None):
         decision["notes"].append(note)
     return {"symbol": sym, "sector": sector, "held": held, "analysts": reports, "debate": debate,
             "manager": decision, "action_raw": action_raw, "action": action,
-            "confidence": decision["confidence"], "agent_mode": "llm" if use_llm else "rule-based", "io": io}
+            "confidence": decision["confidence"],
+            "agent_mode": f"llm:{llm.provider}" if use_llm else "rule-based", "io": io}

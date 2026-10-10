@@ -129,22 +129,42 @@ WEAK_MARKET_RISK_FACTOR = 0.5     # applied when NIFTY < its 200-day average
 STARTING_CAPITAL = 500_000.0
 COST_PER_SIDE = 0.0015
 
+# ---------------------------------------------------------------- secrets
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 # ---------------------------------------------------------------- agents / LLM
-ANALYST_MODEL = os.environ.get("SWARM_ANALYST_MODEL", "claude-haiku-5-5")
-MANAGER_MODEL = os.environ.get("SWARM_MANAGER_MODEL", "claude-sonnet-5-5")
+# Which LLM service runs the swarm: "anthropic" or "sarvam". When unset, the
+# provider whose key is present is used (Anthropic first if both are set).
+LLM_PROVIDERS = ("anthropic", "sarvam")
+LLM_PROVIDER = os.environ.get("SWARM_LLM_PROVIDER", "").strip().lower() or (
+    "anthropic" if ANTHROPIC_API_KEY else ("sarvam" if SARVAM_API_KEY else "anthropic"))
+_DEFAULT_MODELS = {"anthropic": ("claude-haiku-5-5", "claude-sonnet-5-5"),
+                   "sarvam": ("sarvam-105b", "sarvam-105b")}
+_defaults = _DEFAULT_MODELS.get(LLM_PROVIDER, _DEFAULT_MODELS["anthropic"])
+ANALYST_MODEL = os.environ.get("SWARM_ANALYST_MODEL", _defaults[0])
+MANAGER_MODEL = os.environ.get("SWARM_MANAGER_MODEL", _defaults[1])
+# Effort: low | medium | high | max. Anthropic: output_config.effort. Sarvam:
+# reasoning_effort (medium is Sarvam's own default, so it is simply not sent).
 ANALYST_EFFORT = os.environ.get("SWARM_ANALYST_EFFORT", "low")
 MANAGER_EFFORT = os.environ.get("SWARM_MANAGER_EFFORT", "medium")
-ANALYST_MAX_TOKENS = 4000         # thinking counts toward this, so leave room
+ANALYST_MAX_TOKENS = 4000         # thinking/reasoning counts toward this, so leave room
 MANAGER_MAX_TOKENS = 8000
 LLM_TIMEOUT = 90
-# On a safety-classifier refusal the API reruns the manager call on a fallback
-# model ("fallbacks": "default"). Set SWARM_MANAGER_FALLBACK=0 to turn it off.
+# Anthropic only: on a safety-classifier refusal the API reruns the manager call
+# on a fallback model ("fallbacks": "default"). SWARM_MANAGER_FALLBACK=0 turns it off.
 MANAGER_REFUSAL_FALLBACK = os.environ.get("SWARM_MANAGER_FALLBACK", "1") != "0"
 PAYLOAD_TOKEN_CEILING = 3000      # rough per-agent data budget (chars / 4)
 
-# ---------------------------------------------------------------- secrets
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Sarvam: OpenAI-style chat completions. sarvam-105b is documented on the v1
+# route (v2 needs beta access). Temperature 0.2 is v1's own default; kept low
+# so reruns of the same brief give similar answers.
+SARVAM_URL = os.environ.get("SARVAM_URL", "https://api.sarvam.ai/v1/chat/completions")
+SARVAM_TEMPERATURE = float(os.environ.get("SARVAM_TEMPERATURE", "0.2"))
+# Sarvam does not publish sarvam-105b's context window, so concall text sent for
+# summary is capped lower than for Claude (about 10k tokens instead of 15k).
+SARVAM_MAX_DOC_CHARS = 40_000
 
 DEFAULT_DB = os.environ.get("SWARM_DB", "journal.db")

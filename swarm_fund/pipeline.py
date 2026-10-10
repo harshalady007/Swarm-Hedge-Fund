@@ -36,11 +36,16 @@ def run(db_path, offline=False, asof=None, llm=None, quiet=False):
     ctx = Ctx(con=con, day=requested, offline=offline, is_asof=bool(asof))
 
     if llm is None:
-        llm = agents.LLM(api_key="" if offline else None)
+        try:
+            llm = agents.make_llm(offline)
+        except ValueError as e:
+            raise RunError(str(e)) from e
     if not llm.enabled:
         banner("RULE-BASED AGENTS: no LLM will be called "
-               + ("(--offline)" if offline else "(ANTHROPIC_API_KEY is not set)")
+               + ("(--offline)" if offline else f"({agents.key_name(llm.provider)} is not set)")
                + ". Signals below are NOT from the swarm.")
+    else:
+        print(f"LLM provider: {llm.provider} (analysts {config.ANALYST_MODEL}, manager {config.MANAGER_MODEL})")
     if offline:
         banner("OFFLINE MODE: all market data below is synthetic.")
 
@@ -150,7 +155,7 @@ def run(db_path, offline=False, asof=None, llm=None, quiet=False):
                                  for k, x in r["datasets"].items()}
         sid = journal.log_signal(con, T, row, detail, r["io"])
         journal.place_order(con, sid, T, row)
-        rule_based = r["agent_mode"] != "llm"
+        rule_based = r["agent_mode"] == "rule-based"
         if v["status"] == "APPROVED":
             n_buy += 1
             messages.append(notify.buy_message({**row, "weight_pct": v.get("weight_pct", 0)},
@@ -163,7 +168,7 @@ def run(db_path, offline=False, asof=None, llm=None, quiet=False):
             print(f"  risk officer vetoed BUY {r['symbol']}: {v['veto_reason']}")
     con.commit()
     journal.record_equity(con, T, prices, nifty_close)
-    agent_mode = "llm" if llm.enabled else "rule-based"
+    agent_mode = f"llm:{llm.provider}" if llm.enabled else "rule-based"
     journal.finish_run(con, T, "offline" if offline else "live", agent_mode, len(results), n_buy, n_sell,
                        note="; ".join(ctx.log)[:2000])
 

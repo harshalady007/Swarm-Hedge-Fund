@@ -32,12 +32,41 @@ python main.py run --offline --db /tmp/try.db   # full pipeline on synthetic dat
 
 | Variable | Needed for | Without it |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | the LLM swarm and concall summaries | rule-based stand-in agents, with a loud banner on every run and message |
+| `SWARM_LLM_PROVIDER` | `anthropic` or `sarvam` | whichever key below is set (Anthropic first) |
+| `ANTHROPIC_API_KEY` or `SARVAM_API_KEY` | the LLM swarm and concall summaries | rule-based stand-in agents, with a loud banner on every run and message |
 | `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram messages | console output only |
-| `SWARM_ANALYST_MODEL` | analysts, debaters, document summaries | `claude-haiku-5-5` |
-| `SWARM_MANAGER_MODEL` | portfolio manager | `claude-sonnet-5-5` |
-| `SWARM_MANAGER_FALLBACK=0` | turns off the API's refusal fallback for the manager | on |
+| `SWARM_ANALYST_MODEL` | analysts, debaters, document summaries | `claude-haiku-5-5`, or `sarvam-105b` on Sarvam |
+| `SWARM_MANAGER_MODEL` | portfolio manager | `claude-sonnet-5-5`, or `sarvam-105b` on Sarvam |
+| `SWARM_ANALYST_EFFORT`, `SWARM_MANAGER_EFFORT` | how hard the model thinks (`low`/`medium`/`high`/`max`) | `low` and `medium` |
+| `SWARM_MANAGER_FALLBACK=0` | turns off Anthropic's refusal fallback for the manager | on (Anthropic only) |
 | `SWARM_DB` | journal path | `journal.db` in the current directory |
+
+### Choosing the LLM: Anthropic or Sarvam
+
+Both run the same swarm with the same prompts; only the client differs
+(`agents.LLM` and `agents.SarvamLLM`). Set the provider and its key in `.env`, then
+run `python main.py doctor`: its last row sends one tiny request to each configured
+model and shows the reply, so a wrong key or model name shows up before a real run.
+
+Sarvam notes (from Sarvam's docs, October 2026):
+
+* Calls go to `https://api.sarvam.ai/v1/chat/completions` with model `sarvam-105b`
+  (the v2 route needs beta access). The key is sent as `api-subscription-key` and as a
+  Bearer token, because the docs list both.
+* Replies are requested as Structured Outputs (a strict JSON schema). If Sarvam rejects
+  that, the call is retried once in plain JSON mode, and the usual defensive parsing
+  applies. Rate limits, overloads and timeouts get one retry.
+* Effort maps to Sarvam's `reasoning_effort`: `low`, `high` and `max` are sent as is;
+  `medium` is Sarvam's default and is not sent. Reasoning tokens count toward
+  `max_tokens` and are billed as output.
+* Sarvam does not publish `sarvam-105b`'s context window, so concall text sent for a
+  summary is capped at 40,000 characters instead of 60,000.
+* Cost estimate at Sarvam's listed rates (₹29.28 input, ₹73.20 output per million
+  tokens): about ₹8 a day for 5-8 stocks, more if the model reasons at length. Check
+  your usage in Sarvam's dashboard after the first few runs.
+* `report` shows how many runs used each provider (`llm:sarvam`, `llm:anthropic`,
+  `rule-based`), so a record never mixes them silently. Using a separate `--db` per
+  provider keeps two paper records apart if you want to compare them.
 
 Every other setting is in `swarm_fund/config.py`.
 
@@ -176,7 +205,7 @@ All free, no credit card. Status from a cloud host on 2026-10-10:
 | Insider / promoter trades | NSE via `nsepython` | **broken** | Every date-filtered query returns zero rows, even market-wide over three months. A market-wide canary detects this and the data is reported UNAVAILABLE. BSE's API was blocked from the test host |
 | FII / DII flows | NSE via `nsepython` | works | Only the latest session is served; history accumulates in SQLite |
 | Delivery % | NSE full bhavcopy via `nsepython` | works | Validated against the file's own date (NSE returns an older file for holidays) |
-| Concall transcripts / presentations | NSE PDF attachments + `pypdf` | works | Summarised once by the analyst model and cached by URL; needs an API key |
+| Concall transcripts / presentations | NSE PDF attachments + `pypdf` | works | Summarised once by the analyst model and cached by URL; needs an Anthropic or Sarvam key |
 
 `nsepython` talks to NSE through `curl_cffi`, which imitates Chrome's TLS fingerprint
 because NSE's bot manager blocks plain clients by fingerprint. If you would rather not
@@ -247,8 +276,10 @@ changes nothing in the database.
 * Free data is late or wrong at times. Check anything surprising at the source before
   you trade.
 * Insider-trade data is currently unavailable (see the table above).
-* Concall summaries and LLM agents need an API key; without one the rule-based stand-ins
-  are crude and are not the system you are evaluating.
+* Concall summaries and LLM agents need an Anthropic or Sarvam key; without one the
+  rule-based stand-ins are crude and are not the system you are evaluating.
+* The Sarvam client was tested against faked replies and Sarvam's live endpoint with an
+  invalid key (it answers 403 as documented), not yet with a real key and a full run.
 * Trading days for the earnings guard are weekdays minus `NSE_HOLIDAYS` in `config.py`,
   which ships empty. Add NSE's published holidays each year.
 * A share split during a paper position is not handled (Yahoo re-adjusts history, so the

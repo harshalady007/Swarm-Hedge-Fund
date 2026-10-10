@@ -61,7 +61,7 @@ def manager_reply(**kw):
 
 def test_happy_path_buy():
     res, _ = run({"PORTFOLIO MANAGER": manager_reply()})
-    assert res["action"] == "BUY" and res["confidence"] == 72 and res["agent_mode"] == "llm"
+    assert res["action"] == "BUY" and res["confidence"] == 72 and res["agent_mode"] == "llm:anthropic"
     assert {r["agent"] for r in res["io"]} == {"fundamental", "technical", "news", "macro", "bull", "bear", "manager"}
 
 

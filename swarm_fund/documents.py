@@ -110,7 +110,9 @@ def management_summary(ctx, symbol, ann_res, llm):
         text = extract_pdf_text(with_retry(lambda: _download(doc["link"])))
         if len(text.strip()) < 500:
             raise ValueError("PDF has no usable text layer (scanned image?)")
-        clipped = text[: config.CONCALL_MAX_CHARS_TO_MODEL].replace("<", "‹").replace(">", "›")
+        limit = config.SARVAM_MAX_DOC_CHARS if getattr(llm, "provider", "") == "sarvam" \
+            else config.CONCALL_MAX_CHARS_TO_MODEL
+        clipped = text[:limit].replace("<", "‹").replace(">", "›")
         user = f"Company: {config.COMPANY_NAMES.get(symbol, symbol)} ({symbol})\n" \
                f"Filed: {doc['date']}  Subject: {doc.get('subject')}\n" \
                f"<untrusted_document>\n{clipped}\n</untrusted_document>"
@@ -121,7 +123,7 @@ def management_summary(ctx, symbol, ann_res, llm):
         summary = normalise(obj)
         store_summary(ctx.con, doc["link"], symbol, doc, len(text), summary, config.ANALYST_MODEL)
         return {"document": meta, "summary": summary, "summarised_by": config.ANALYST_MODEL,
-                "characters_read": min(len(text), config.CONCALL_MAX_CHARS_TO_MODEL),
+                "characters_read": min(len(text), limit),
                 "characters_in_pdf": len(text)}
 
     # offline and live share one code path; get_dataset adds caching, retries and snapshots

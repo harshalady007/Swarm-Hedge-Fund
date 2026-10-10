@@ -1,6 +1,7 @@
 """`python main.py doctor`: call every live data source once for one stock and print
 source, OK/FAIL, rows returned and time taken. Uses a throwaway in-memory database,
 so nothing is cached and the journal is untouched."""
+import json
 import time
 from datetime import datetime
 
@@ -29,7 +30,7 @@ def checks(ctx, sym):
     yield "google news link decode", lambda: _decode(ctx, sym)
     yield "jina reader article", lambda: _jina(ctx, sym)
     yield "telegram (config only)", _telegram
-    yield "anthropic key (config)", _anthropic
+    yield f"llm: {config.LLM_PROVIDER} (1 tiny call)", _llm
 
 
 def _prices(ctx, tickers):
@@ -120,11 +121,24 @@ def _telegram():
             "detail": "configured (no message sent)" if ok else ""}
 
 
-def _anthropic():
-    ok = bool(config.ANTHROPIC_API_KEY)
-    return {"status": "set" if ok else "not set", "rows": 0,
-            "error": None if ok else "ANTHROPIC_API_KEY not set: runs will use rule-based agents",
-            "detail": f"analysts {config.ANALYST_MODEL}, manager {config.MANAGER_MODEL}" if ok else ""}
+def _llm():
+    """One small real request: proves the key, the model name and JSON replies work."""
+    import agents
+    llm = agents.make_llm(offline=False)
+    if not llm.enabled:
+        return {"status": "not set", "rows": 0,
+                "error": f"{agents.key_name(llm.provider)} not set: runs will use rule-based agents"}
+    schema = {"type": "object", "additionalProperties": False, "required": ["ok"],
+              "properties": {"ok": {"type": "boolean"}}}
+    models = dict.fromkeys([config.ANALYST_MODEL, config.MANAGER_MODEL])
+    answers = []
+    for model in models:
+        obj, err = llm.json_call(model, 'Health check. Reply with the JSON object {"ok": true}.', "ping", schema,
+                                 2000, "low")
+        if obj is None:
+            return {"status": "unavailable", "rows": len(answers), "error": f"{model}: {err}"}
+        answers.append(f"{model} -> {json.dumps(obj)}")
+    return {"status": "ok", "rows": len(answers), "detail": "; ".join(answers)}
 
 
 def _rows(res):
