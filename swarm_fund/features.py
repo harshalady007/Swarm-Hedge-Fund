@@ -301,3 +301,31 @@ def flow_summary(rows, day: date, windows=None):
     if notes:
         out["history_note"] = "; ".join(notes)
     return out, []
+
+
+# ============================================================== phase 3: delivery
+def delivery_summary(rows, day: date, df: pd.DataFrame | None = None, n=None):
+    """Today's delivery percentage against the average of the previous n stored
+    sessions, plus today's price move so the agent can read "high delivery on an
+    up day". Returns (summary | None, gaps)."""
+    n = n or config.DELIVERY_AVG_DAYS
+    rows = [r for r in rows or [] if r["date"] <= day.isoformat() and r.get("deliv_pct") is not None]
+    today = next((r for r in rows if r["date"] == day.isoformat()), None)
+    prior = [r["deliv_pct"] for r in rows if r["date"] < day.isoformat()][-n:]
+    gaps = []
+    if not rows:
+        return None, ["delivery percentage: no bhavcopy history stored"]
+    out = {"sessions_in_average": len(prior)}
+    if prior:
+        out["avg_pct"] = _r(sum(prior) / len(prior), 2)
+    if today:
+        out["today_pct"] = _r(today["deliv_pct"], 2)
+        if prior:
+            out["today_vs_avg_pp"] = _r(today["deliv_pct"] - sum(prior) / len(prior), 2)
+    else:
+        gaps.append(f"delivery percentage for {day} not available yet (bhavcopy not published or fetch failed)")
+    if len(prior) < n:
+        out["note"] = f"average uses only {len(prior)} of {n} sessions stored so far"
+    if df is not None and len(df) >= 2:
+        out["price_change_today_pct"] = _r((df["Close"].iloc[-1] / df["Close"].iloc[-2] - 1) * 100, 2)
+    return out, gaps

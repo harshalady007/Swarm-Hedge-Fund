@@ -6,4 +6,5 @@ pandas>=2.1
 numpy>=1.26
 feedparser>=6.0        # Google News RSS parsing
 nsepython>=2.101       # NSE announcements, results calendar, insider trades, FII/DII, bhavcopy (GPL-3.0)
+pypdf>=4.0             # text extraction from concall transcripts and presentations
 pytest>=8.0            # tests

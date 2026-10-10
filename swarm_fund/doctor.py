@@ -24,6 +24,10 @@ def checks(ctx, sym):
     yield "nse insider (market canary)", lambda: canary.setdefault("r", exchange.insider_canary(ctx))
     yield "nse insider (this stock)", lambda: exchange.insider_trades(ctx, sym, canary.get("r"))
     yield "nse fii/dii", lambda: exchange.fii_dii(ctx)
+    yield "nse bhavcopy (delivery %)", lambda: _bhavcopy(ctx, sym)
+    yield "nse transcript pdf + pypdf", lambda: _pdf(ctx, sym)
+    yield "google news link decode", lambda: _decode(ctx, sym)
+    yield "jina reader article", lambda: _jina(ctx, sym)
     yield "telegram (config only)", _telegram
     yield "anthropic key (config)", _anthropic
 
@@ -35,6 +39,58 @@ def _prices(ctx, tickers):
     if missing:
         return {"status": "unavailable", "data": None, "error": f"missing {missing}", "rows": rows}
     return {"status": "ok", "rows": rows, "detail": ", ".join(f"{t}:{len(df)}" for t, df in p.items())}
+
+
+def _bhavcopy(ctx, sym):
+    """Latest published bhavcopy: try today, then step back up to five weekdays."""
+    import exchange
+    from datetime import timedelta
+    d, tried = ctx.day, []
+    for _ in range(6):
+        if d.weekday() < 5:
+            try:
+                rows = exchange.parse_bhavcopy(exchange._nse_bhavcopy(d), d, list(config.UNIVERSE))
+                mine = next((r for r in rows if r["symbol"] == sym), {})
+                return {"status": "ok", "rows": len(rows),
+                        "detail": f"{d}: {sym} delivery {mine.get('deliv_pct')}%" + (f" (tried {tried})" if tried else "")}
+            except Exception as e:  # noqa: BLE001
+                tried.append(f"{d}: {str(e)[:60]}")
+        d -= timedelta(days=1)
+    return {"status": "unavailable", "error": "; ".join(tried)[:200]}
+
+
+def _pdf(ctx, sym):
+    import documents
+    import exchange
+    ann = exchange.announcements(ctx, sym)
+    if ann["status"] == "unavailable":
+        return ann
+    doc = documents.pick_document(ann["data"], ctx.day)
+    if doc is None:
+        return {"status": "empty", "rows": 0,
+                "detail": f"no transcript/presentation filed in {config.CONCALL_LOOKBACK_DAYS} days"}
+    text = documents.extract_pdf_text(documents._download(doc["link"]))
+    return {"status": "ok" if len(text) > 500 else "unavailable", "rows": len(text),
+            "detail": f"{doc['date']} {doc['subject']}: {len(text):,} characters extracted",
+            "error": None if len(text) > 500 else "no text layer"}
+
+
+def _first_headline(ctx, sym):
+    res = data.headlines(ctx, sym)
+    if res["status"] != "ok":
+        raise RuntimeError(f"no headline to test with ({res['status']})")
+    return res["data"][0]
+
+
+def _decode(ctx, sym):
+    url = data.resolve_google_news(_first_headline(ctx, sym)["link"])
+    return {"status": "ok", "rows": 1, "detail": url[:110]}
+
+
+def _jina(ctx, sym):
+    url = data.resolve_google_news(_first_headline(ctx, sym)["link"])
+    text = data.jina_text(url)
+    return {"status": "ok", "rows": len(text.split()), "detail": f"{len(text.split())} words from {url[:70]}"}
 
 
 def _calendar(ctx, sym):

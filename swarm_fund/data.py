@@ -328,3 +328,105 @@ def fake_headlines(symbol, day):
 
 def dumps(obj) -> str:
     return json.dumps(obj, default=str, separators=(",", ":"))
+
+
+# ================================================================= article text
+# Google News RSS links are not HTTP redirects any more. The article page carries
+# a signature and timestamp that Google's own batchexecute endpoint exchanges for
+# the publisher URL; this is what the (currently broken) googlenewsdecoder
+# package does, written out here so it has no extra dependencies.
+JINA_UA = "swarm-signal-desk/1.0 (personal research; low volume)"   # a browser UA trips Jina's bot check
+_jina_last = [0.0]
+_BAD_TITLES = ("just a moment", "page not found", "access denied", "403 forbidden", "404", "attention required",
+               "are you a robot", "subscribe to continue")
+
+
+def resolve_google_news(link):
+    import re
+    from urllib.parse import urlparse
+    if "news.google.com" not in link:
+        return link
+    gid = urlparse(link).path.rstrip("/").split("/")[-1]
+    page = http_get(f"https://news.google.com/rss/articles/{gid}").text
+    sg, ts = re.search(r'data-n-a-sg="([^"]+)"', page), re.search(r'data-n-a-ts="([^"]+)"', page)
+    if not (sg and ts):
+        raise ValueError("Google News page has no decoding signature")
+    inner = ["garturlreq", [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None, None,
+                             None, 0, 1], "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0],
+             gid, int(ts.group(1)), sg.group(1)]
+    import requests
+    r = requests.post("https://news.google.com/_/DotsSplashUi/data/batchexecute",
+                      data={"f.req": json.dumps([[["Fbv4je", json.dumps(inner), None, "generic"]]])},
+                      headers={"User-Agent": BROWSER_UA,
+                               "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"},
+                      timeout=config.HTTP_TIMEOUT)
+    r.raise_for_status()
+    url = json.loads(json.loads(r.text.split("\n\n", 1)[1])[0][2])[1]
+    if not str(url).startswith("http"):
+        raise ValueError("could not decode Google News link")
+    return url
+
+
+def jina_text(url):
+    """Readable text of an article through Jina Reader (free, about 20 requests a minute)."""
+    import time
+    wait = config.JINA_MIN_INTERVAL_SECONDS - (time.time() - _jina_last[0])
+    if wait > 0:
+        time.sleep(wait)
+    _jina_last[0] = time.time()
+    r = http_get(f"https://r.jina.ai/{url}", headers={"User-Agent": JINA_UA, "Accept": "text/plain"}, timeout=45)
+    return clean_article(r.text)
+
+
+def clean_article(text, max_words=None):
+    """Strip Jina's header lines and markdown clutter, reject error pages, truncate."""
+    import re
+    max_words = max_words or config.ARTICLE_MAX_WORDS
+    title = ""
+    m = re.search(r"^Title:\s*(.*)$", text, flags=re.M)
+    if m:
+        title = m.group(1).strip()
+    if any(b in title.lower() for b in _BAD_TITLES):
+        raise ValueError(f"publisher returned an error page ({title[:60]})")
+    body = text.split("Markdown Content:", 1)[1] if "Markdown Content:" in text else text
+    body = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", body)                  # images
+    body = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", body)                 # links -> their text
+    body = re.sub(r"(?m)^\s*[#>*\-|=_]+\s*", " ", body)                   # markdown line prefixes
+    words = body.split()
+    if len(words) < 60:
+        raise ValueError(f"too little article text ({len(words)} words)")
+    clipped = words[:max_words]
+    return " ".join(clipped) + (" …" if len(words) > max_words else "")
+
+
+def articles(ctx, symbol, headlines_res):
+    """Readable text for the newest ARTICLES_PER_STOCK headlines. Failed fetches fall
+    back to headline-only and are counted. Each article URL is cached for good."""
+    def live():
+        if headlines_res is None or headlines_res.get("status") != "ok":
+            return []
+        out = []
+        for h in headlines_res["data"][: config.ARTICLES_PER_STOCK]:
+            key = f"article|{h['link']}"
+            hit = db.cache_get(ctx.con, key)
+            if hit is None:
+                try:
+                    url = with_retry(lambda: resolve_google_news(h["link"]))
+                    hit = {"url": url, "text": jina_text(url)}
+                    db.cache_put(ctx.con, key, hit)
+                except Exception as e:  # noqa: BLE001 - fall back to the headline alone
+                    hit = {"url": None, "text": None, "error": f"{type(e).__name__}: {str(e)[:120]}"}
+            out.append({"title": h["title"], "source": h.get("source"), "published": h.get("published"), **hit})
+        if out and all(a.get("text") is None for a in out):
+            raise RuntimeError("every article fetch failed: " + "; ".join(a.get("error", "") for a in out)[:300])
+        return out
+
+    def fake():
+        if headlines_res is None or headlines_res.get("status") != "ok":
+            return []
+        return [{"title": h["title"], "source": h.get("source"), "published": h.get("published"),
+                 "url": h["link"], "text": f"(synthetic offline article) {h['title']}. " + "Details follow. " * 30}
+                for h in headlines_res["data"][: config.ARTICLES_PER_STOCK]]
+
+    return get_dataset(ctx, "articles", symbol, live, fake, asof_supported=False,
+                       asof_reason="articles may have been edited since that date", retries=0)

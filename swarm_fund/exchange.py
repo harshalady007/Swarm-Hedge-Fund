@@ -28,7 +28,7 @@ import numpy as np
 
 import config
 from data import seed_for
-from fetch import get_dataset
+from fetch import get_dataset, with_retry
 
 _last_call = [0.0]
 
@@ -75,8 +75,10 @@ def _num(x):
 
 # ============================================================ announcements
 def announcements(ctx, symbol):
-    """Corporate announcements filed in the last ANNOUNCEMENT_DAYS days, oldest first."""
-    start = ctx.day - timedelta(days=config.ANNOUNCEMENT_DAYS)
+    """Corporate announcements, oldest first. One call covers the longer of the news
+    window (ANNOUNCEMENT_DAYS) and the transcript search (CONCALL_LOOKBACK_DAYS);
+    recent_filings() narrows it for the news analyst."""
+    start = ctx.day - timedelta(days=max(config.ANNOUNCEMENT_DAYS, config.CONCALL_LOOKBACK_DAYS))
 
     def live():
         url = (f"https://www.nseindia.com/api/corporate-announcements?index=equities&symbol={quote(symbol)}"
@@ -86,6 +88,11 @@ def announcements(ctx, symbol):
             raise ValueError(f"unexpected reply type {type(rows).__name__}")
         return clean_announcements(rows, symbol, ctx.day)
     return get_dataset(ctx, "announcements", symbol, live, lambda: fake_announcements(symbol, ctx.day))
+
+
+def recent_filings(items, day: date, days=None):
+    start = (day - timedelta(days=days or config.ANNOUNCEMENT_DAYS)).isoformat()
+    return [a for a in items or [] if a["date"][:10] >= start]
 
 
 def clean_announcements(rows, symbol, day):
@@ -115,7 +122,7 @@ _ANN = [("Copy of Newspaper Publication", "has informed the Exchange about Copy 
 def fake_announcements(symbol, day):
     name = config.COMPANY_NAMES.get(symbol, symbol)
     out = []
-    for back in range(config.ANNOUNCEMENT_DAYS + 1):
+    for back in range(max(config.ANNOUNCEMENT_DAYS, config.CONCALL_LOOKBACK_DAYS) + 1):
         d = day - timedelta(days=back)
         rng = np.random.default_rng(seed_for(symbol, d.isoformat(), "ann"))
         if rng.random() < 0.12:
@@ -274,3 +281,90 @@ def fake_fii_dii(day):
             {"date": day.isoformat(), "category": "DII", "buy_cr": 11000.0, "sell_cr": round(11000 - dii, 2),
              "net_cr": round(dii, 2)}]
 
+
+
+# ========================================================= delivery (bhavcopy)
+BHAV_COLS = ("SYMBOL", "SERIES", "DATE1", "TTL_TRD_QNTY", "DELIV_QTY", "DELIV_PER")
+
+
+def parse_bhavcopy(df, day: date, symbols):
+    """Validate an NSE full bhavcopy and pull delivery figures for `symbols`.
+
+    NSE answers a request for a non-trading day with an older file (asked for
+    Sunday 2026-10-04, it returned 2026-10-01) and a future day with an HTML
+    page, so the file's own DATE1 column must match the day asked for."""
+    if df is None or not hasattr(df, "columns") or len(df) == 0:
+        raise ValueError("empty bhavcopy")
+    df = df.rename(columns=lambda c: str(c).strip().upper())
+    missing = [c for c in BHAV_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"bhavcopy missing columns {missing}")
+    for c in ("SYMBOL", "SERIES", "DATE1"):
+        df[c] = df[c].astype(str).str.strip()
+    dates = set(df["DATE1"].unique())
+    want = day.strftime("%d-%b-%Y")
+    if dates != {want}:
+        raise ValueError(f"NSE returned the bhavcopy for {sorted(dates)[:3]} when asked for {want}")
+    eq = df[(df["SERIES"] == "EQ") & (df["SYMBOL"].isin(symbols))]
+    out = []
+    for _, r in eq.iterrows():
+        out.append({"date": day.isoformat(), "symbol": r["SYMBOL"], "deliv_pct": _num(r["DELIV_PER"]),
+                    "deliv_qty": _num(r["DELIV_QTY"]), "traded_qty": _num(r["TTL_TRD_QNTY"])})
+    if not out:
+        raise ValueError("bhavcopy has none of the universe symbols in the EQ series")
+    return out
+
+
+def fake_bhavcopy_rows(day: date, symbols):
+    out = []
+    for s in symbols:
+        rng = np.random.default_rng(seed_for(s, day.isoformat(), "deliv"))
+        pct = float(np.clip(rng.normal(45, 12), 8, 95))
+        traded = float(rng.integers(500_000, 9_000_000))
+        out.append({"date": day.isoformat(), "symbol": s, "deliv_pct": round(pct, 2),
+                    "deliv_qty": round(traded * pct / 100), "traded_qty": traded})
+    return out
+
+
+def delivery_history(ctx, calendar):
+    """Make sure the delivery table holds the run day and the DELIVERY_BACKFILL_DAYS
+    sessions before it. Each bhavcopy is fetched once and kept forever (the
+    archive is dated, so --asof runs can rebuild history without lookahead).
+    Returns a status dict for the run day."""
+    symbols = list(config.UNIVERSE)
+    sessions = [d for d in calendar if d <= ctx.day_str][-(config.DELIVERY_BACKFILL_DAYS + 1):]
+    have = {r[0] for r in ctx.con.execute("SELECT DISTINCT date FROM delivery WHERE date >= ?", (sessions[0],))}
+    failed, fetched, consecutive = [], [], 0
+    for d in sessions:
+        if d in have:
+            continue
+        day = date.fromisoformat(d)
+        try:
+            if ctx.offline:
+                rows = fake_bhavcopy_rows(day, symbols)
+            else:
+                rows = with_retry(lambda: parse_bhavcopy(_nse_bhavcopy(day), day, symbols))
+            ctx.con.executemany(
+                "INSERT OR IGNORE INTO delivery (date, symbol, deliv_pct, deliv_qty, traded_qty, source)"
+                " VALUES (:date, :symbol, :deliv_pct, :deliv_qty, :traded_qty, :source)",
+                [{**r, "source": "offline-fake" if ctx.offline else "nse-bhavcopy"} for r in rows])
+            ctx.con.commit()
+            fetched.append(d)
+            consecutive = 0
+        except Exception as e:  # noqa: BLE001
+            failed.append(f"{d}: {type(e).__name__}: {str(e)[:120]}")
+            consecutive += 1
+            if consecutive >= 2:
+                failed.append("stopped backfill after two consecutive failures")
+                break
+    today_ok = ctx.con.execute("SELECT 1 FROM delivery WHERE date=? LIMIT 1", (ctx.day_str,)).fetchone()
+    if failed:
+        ctx.note("delivery: " + "; ".join(failed[:3]))
+    return {"status": "ok" if today_ok else "unavailable", "fetched": fetched, "failed": failed,
+            "error": None if today_ok else (f"bhavcopy for {ctx.day_str} not available yet"
+                                            + (f" ({failed[-1]})" if failed else ""))}
+
+
+def delivery_rows(con, symbol, upto_day: str):
+    return [dict(r) for r in con.execute("SELECT date, deliv_pct FROM delivery WHERE symbol=? AND date<=?"
+                                         " ORDER BY date", (symbol, upto_day))]
