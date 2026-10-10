@@ -135,6 +135,15 @@ def _next_session(calendar, day):
 
 
 def _apply_day(con, prices, day, calendar):
+    # 0) catch up on earlier bars that were missing when their day was processed
+    for p in open_positions(con):
+        for bar_day, bar in _bars_after(prices, p["symbol"], p["checked_through"] or p["entry_day"], day):
+            if bar_day >= day:
+                break
+            con.execute("UPDATE positions SET checked_through=? WHERE id=?", (bar_day, p["id"]))
+            if _check_exits(con, p, bar, bar_day, filled_today=False):
+                break
+
     # 1) orders whose next session is today
     for o in pending_orders(con):
         if _next_session(calendar, o["created_day"]) != day:
@@ -148,18 +157,22 @@ def _apply_day(con, prices, day, calendar):
             _event(con, day, "EXPIRED", o["symbol"], f"{o['side']} {o['symbol']} expired: no price bar for {day}")
             continue
         if o["side"] == "SELL":
-            for p in open_positions(con):
-                if p["symbol"] == o["symbol"]:
-                    _close(con, p, day, bar["Open"], "SELL_SIGNAL")
-            _resolve(con, o, "FILLED", day, fill_price=bar["Open"])
+            held = [p for p in open_positions(con) if p["symbol"] == o["symbol"]]
+            for p in held:
+                _close(con, p, day, bar["Open"], "SELL_SIGNAL")
+            if held:
+                _resolve(con, o, "FILLED", day, fill_price=bar["Open"])
+            else:
+                _resolve(con, o, "EXPIRED", day, note="position already closed by its stop or target")
             continue
         if bar["Open"] <= o["entry_high"] and bar["Open"] > o["stop"]:
             _resolve(con, o, "FILLED", day, fill_price=bar["Open"])
             cur = con.execute(
                 "INSERT INTO positions (order_id, signal_day, symbol, sector, qty, entry_day, entry_price,"
-                " entry_cash, stop, target, entry_high, status) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'OPEN')",
+                " entry_cash, stop, target, entry_high, checked_through, status)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'OPEN')",
                 (o["id"], o["created_day"], o["symbol"], o["sector"], o["qty"], day, bar["Open"],
-                 o["qty"] * bar["Open"] * (1 + C), o["stop"], o["target"], o["entry_high"]))
+                 o["qty"] * bar["Open"] * (1 + C), o["stop"], o["target"], o["entry_high"], day))
             _event(con, day, "FILL", o["symbol"],
                    f"BUY {o['symbol']} filled: {o['qty']} @ {bar['Open']:.2f} "
                    f"(stop {o['stop']:.2f}, target {o['target']:.2f})")
@@ -171,16 +184,31 @@ def _apply_day(con, prices, day, calendar):
             _resolve(con, o, "EXPIRED", day, note=why)
             _event(con, day, "EXPIRED", o["symbol"], f"BUY {o['symbol']} expired unfilled: {why}")
 
-    # 2) stops and targets on positions that were already open before today
+    # 2) today's stops and targets on positions opened before today
     for p in open_positions(con):
         if p["entry_day"] >= day:
             continue
         bar = _bar(prices, p["symbol"], day)
         if bar is not None:
+            con.execute("UPDATE positions SET checked_through=? WHERE id=?", (day, p["id"]))
             _check_exits(con, p, bar, day, filled_today=False)
+        else:
+            _event(con, day, "WARN", p["symbol"],
+                   f"{p['symbol']}: no price bar for {day}; stop and target not checked yet "
+                   "(they will be when the bar arrives)")
+
+
+def _bars_after(prices, symbol, after_day, upto_day):
+    df = prices.get(symbol)
+    if df is None:
+        return []
+    sel = df[(df.index > pd.Timestamp(after_day)) & (df.index <= pd.Timestamp(upto_day))]
+    return [(ts.strftime("%Y-%m-%d"), {k: float(r[k]) for k in ("Open", "High", "Low", "Close")})
+            for ts, r in sel.iterrows()]
 
 
 def _check_exits(con, p, bar, day, filled_today):
+    """Returns True when the position was closed on this bar."""
     stop, target = p["stop"], p["target"]
     if not filled_today and bar["Open"] <= stop:
         _close(con, p, day, bar["Open"], "STOP_GAP")
@@ -190,6 +218,9 @@ def _check_exits(con, p, bar, day, filled_today):
         _close(con, p, day, bar["Open"], "TARGET_GAP")
     elif bar["High"] >= target:
         _close(con, p, day, target, "TARGET")
+    else:
+        return False
+    return True
 
 
 def _close(con, p, day, price, reason):
@@ -363,6 +394,10 @@ def report(con):
     for p in opens:
         lines.append(f"  {p['symbol']:<11} {p['qty']:>5} @ {p['entry_price']:.2f} since {p['entry_day']}"
                      f"  stop {p['stop']:.2f} target {p['target']:.2f}")
+    for o in pending_orders(con):
+        lines.append(f"  pending {o['side']} {o['symbol']} from {o['created_day']}"
+                     + (f": {o['qty']} in {o['entry_low']:.2f}-{o['entry_high']:.2f}, stop {o['stop']:.2f}"
+                        if o["side"] == "BUY" else " at next open"))
     for p in closed[-10:]:
         lines.append(f"  closed {p['symbol']:<11} {p['entry_day']} -> {p['exit_day']} {p['exit_reason']:<11}"
                      f" P&L {p['pnl']:+,.0f}")

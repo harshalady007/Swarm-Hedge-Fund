@@ -147,3 +147,34 @@ def test_trade_stats_and_sample_note():
     assert st["n"] == 3 and st["win_rate_pct"] == pytest.approx(200 / 3)
     assert st["avg_win_pct"] == pytest.approx(20.0) and st["avg_loss_pct"] == pytest.approx(-5.0)
     assert "far too few" in journal.sample_note(3)
+
+
+def test_missing_bar_warns_and_late_bar_is_still_checked():
+    # bar for 01-07 is missing on the first pass; Yahoo fills it in later showing a stop hit
+    con, prices, cal = setup([(100, 100, 100, 100), (100, 101, 99, 100), (96, 97, 93, 94), (99, 100, 98, 99)])
+    full = prices["AAA"].copy()
+    prices["AAA"] = full.drop(pd.Timestamp("2026-01-07"))
+    add_buy(con)
+    journal.advance(con, prices, cal, "2026-01-07")
+    warns = [e for e in journal.unnotified_events(con) if e["kind"] == "WARN"]
+    assert warns and "no price bar for 2026-01-07" in warns[0]["message"]
+    assert positions(con)[0]["status"] == "OPEN"
+    prices["AAA"] = full                                   # the late bar arrives
+    journal.advance(con, prices, cal, "2026-01-08")
+    p = positions(con)[0]
+    assert p["exit_reason"] == "STOP" and p["exit_day"] == "2026-01-07" and p["exit_price"] == 95.0
+
+
+def test_sell_after_late_stop_does_not_sell_twice():
+    con, prices, cal = setup([(100, 100, 100, 100), (100, 101, 99, 100), (96, 97, 93, 94), (99, 100, 98, 99)])
+    full = prices["AAA"].copy()
+    prices["AAA"] = full.drop(pd.Timestamp("2026-01-07"))
+    add_buy(con)
+    journal.advance(con, prices, cal, "2026-01-07")
+    journal.place_order(con, None, "2026-01-07", {"status": "EXIT", "symbol": "AAA", "sector": "IT"})
+    prices["AAA"] = full
+    journal.advance(con, prices, cal, "2026-01-08")
+    assert positions(con)[0]["exit_reason"] == "STOP"
+    sell = [o for o in orders(con) if o["side"] == "SELL"][0]
+    assert sell["status"] == "EXPIRED" and "already closed" in sell["note"]
+    assert journal.cash(con) == pytest.approx(config.STARTING_CAPITAL - 10 * 100 * (1 + C) + 10 * 95 * (1 - C))

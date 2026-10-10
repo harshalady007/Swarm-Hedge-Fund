@@ -333,11 +333,12 @@ def _results_label(info):
 
 
 def source_links(ds):
-    """Newest two exchange filings, then newest two headlines."""
+    """Newest two exchange filings, then the newest headlines (publisher URL when resolved)."""
     links = []
-    ann, news = ds.get("announcements"), ds.get("headlines")
+    ann, news, art = ds.get("announcements"), ds.get("headlines"), ds.get("articles")
     if ann and ann.get("status") == "ok":
         links += [a["link"] for a in ann["data"][-2:][::-1] if a.get("link")]
+    resolved = {a["title"]: a["url"] for a in (art or {}).get("data") or [] if a.get("url")}
     if news and news.get("status") == "ok":
-        links += [h["link"] for h in news["data"][:2] if h.get("link")]
+        links += [resolved.get(h["title"], h["link"]) for h in news["data"][:2] if h.get("link")]
     return links

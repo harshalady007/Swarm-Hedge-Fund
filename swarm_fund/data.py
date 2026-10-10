@@ -77,6 +77,7 @@ def _yahoo_prices(ctx, tickers):
     return out
 
 
+
 def _frame_to_json(df):
     return {"index": [d.strftime("%Y-%m-%d") for d in df.index],
             "cols": list(df.columns), "values": df.astype(float).round(4).values.tolist()}

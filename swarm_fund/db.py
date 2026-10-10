@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS positions (
     stop REAL NOT NULL,
     target REAL NOT NULL,
     entry_high REAL,
+    checked_through TEXT,             -- last bar date checked for stop/target
     status TEXT NOT NULL,             -- OPEN | CLOSED
     exit_day TEXT,
     exit_price REAL,
