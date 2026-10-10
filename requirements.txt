@@ -5,4 +5,5 @@ requests>=2.31         # Telegram, Google News RSS, Jina Reader, PDF downloads
 pandas>=2.1
 numpy>=1.26
 feedparser>=6.0        # Google News RSS parsing
+nsepython>=2.101       # NSE announcements, results calendar, insider trades, FII/DII, bhavcopy (GPL-3.0)
 pytest>=8.0            # tests

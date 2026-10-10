@@ -213,3 +213,91 @@ def track_record(closed):
             "avg_win_pct": _r(np.mean(wins), 2) if wins else None,
             "avg_loss_pct": _r(np.mean(losses), 2) if losses else None,
             "sample_size_warning": sample_note(len(rets))}
+
+
+# ============================================================ phase 2: exchange
+def trading_days_between(a: date, b: date) -> int:
+    """Weekday sessions from a (inclusive) to b (exclusive), less NSE_HOLIDAYS.
+    0 means b is a itself; 1 means b is the next session."""
+    return int(np.busday_count(a, b, holidays=config.NSE_HOLIDAYS))
+
+
+def earnings_info(res, day: date):
+    """Next results date from the NSE calendar result, for the risk officer and manager.
+    status: known | none_announced | unknown (calendar unavailable)."""
+    if res is None or res.get("status") == "unavailable":
+        return {"status": "unknown", "reason": (res or {}).get("error") or "calendar not fetched"}
+    rows = res.get("data") or []
+    upcoming = sorted(r["date"] for r in rows if r.get("date") and r["date"] >= day.isoformat())
+    past = sorted(r["date"] for r in rows if r.get("date") and r["date"] < day.isoformat())
+    if not upcoming:
+        return {"status": "none_announced", "last_results_meeting": past[-1] if past else None}
+    nxt = date.fromisoformat(upcoming[0])
+    return {"status": "known", "date": nxt.isoformat(), "trading_days_away": trading_days_between(day, nxt),
+            "last_results_meeting": past[-1] if past else None}
+
+
+def insider_summary(rows, day: date, window=None):
+    """Net value bought or sold by promoters and by other insiders, transaction
+    counts and the largest single trade, over trades disclosed in the window."""
+    window = window or config.INSIDER_DAYS
+    start = (day - timedelta(days=window)).isoformat()
+    groups = {"promoters": {"buy": 0.0, "sell": 0.0, "n": 0}, "other_insiders": {"buy": 0.0, "sell": 0.0, "n": 0}}
+    largest, non_trade, undated = None, 0, 0
+    for r in rows or []:
+        if not r.get("disclosed"):
+            undated += 1
+            continue
+        if not (start <= r["disclosed"] <= day.isoformat()):
+            continue
+        kind = (r.get("type") or "").strip().lower()
+        if kind not in ("buy", "sell") or r.get("value") is None:
+            non_trade += 1                      # pledges, revocations, invocations
+            continue
+        g = groups["promoters" if "promoter" in (r.get("category") or "").lower() else "other_insiders"]
+        g[kind] += r["value"]
+        g["n"] += 1
+        if largest is None or r["value"] > largest["value"]:
+            largest = r
+    out = {"window_days": window}
+    for name, g in groups.items():
+        out[name] = {"bought_cr": _r(g["buy"] / 1e7, 2), "sold_cr": _r(g["sell"] / 1e7, 2),
+                     "net_value_cr": _r((g["buy"] - g["sell"]) / 1e7, 2), "transactions": g["n"]}
+    out["largest_trade"] = None if largest is None else {
+        "disclosed": largest["disclosed"], "name": largest.get("name"), "category": largest.get("category"),
+        "type": largest.get("type"), "mode": largest.get("mode"), "value_cr": _r(largest["value"] / 1e7, 2)}
+    if non_trade:
+        out["non_trade_disclosures"] = non_trade
+    if undated:
+        out["undated_rows_ignored"] = undated
+    return out
+
+
+def flow_summary(rows, day: date, windows=None):
+    """Latest FII/DII day plus rolling net totals built from our own stored history.
+    Says plainly when fewer sessions are stored than the window asks for."""
+    windows = windows or config.FLOW_WINDOWS
+    by_date = {}
+    for r in rows or []:
+        if r["date"] <= day.isoformat() and r.get("net_cr") is not None:
+            by_date.setdefault(r["date"], {})[r["category"]] = r["net_cr"]
+    dates = sorted(d for d, v in by_date.items() if "FII" in v and "DII" in v)
+    if not dates:
+        return None, ["FII/DII flows: no stored sessions on or before this date"]
+    latest = dates[-1]
+    out = {"latest_session": latest, "fii_net_cr_latest": _r(by_date[latest]["FII"], 0),
+           "dii_net_cr_latest": _r(by_date[latest]["DII"], 0)}
+    notes = []
+    for w in windows:
+        span = dates[-w:]
+        out[f"fii_net_cr_{w}d"] = _r(sum(by_date[d]["FII"] for d in span), 0)
+        out[f"dii_net_cr_{w}d"] = _r(sum(by_date[d]["DII"] for d in span), 0)
+        out[f"sessions_in_{w}d_total"] = len(span)
+        if len(span) < w:
+            notes.append(f"only {len(span)} of {w} sessions stored so far, so the {w}-day totals are partial")
+    age = (day - date.fromisoformat(latest)).days
+    if age > 4:
+        notes.append(f"latest stored session is {latest}, {age} days before {day}")
+    if notes:
+        out["history_note"] = "; ".join(notes)
+    return out, []

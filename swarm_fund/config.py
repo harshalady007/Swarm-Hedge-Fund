@@ -91,6 +91,10 @@ ANNOUNCEMENTS_SHOWN = 12
 INSIDER_DAYS = 90
 INSIDER_CANARY_DAYS = 14          # a market-wide window that cannot honestly be empty
 EARNINGS_BLACKOUT_DAYS = 3        # trading days
+# Trading days are counted as weekdays minus these dates. Add NSE's published
+# holidays for the year (YYYY-MM-DD); leaving it empty can make a results date
+# look one session further away than it is around a holiday.
+NSE_HOLIDAYS: list[str] = []
 FLOW_WINDOWS = (5, 20)
 
 # Phase 3

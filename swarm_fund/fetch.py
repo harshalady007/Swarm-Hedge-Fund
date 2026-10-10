@@ -79,12 +79,13 @@ def _is_empty(data) -> bool:
 
 def get_dataset(ctx: Ctx, dataset: str, symbol: str, live_fn, fake_fn,
                 asof_supported=True, asof_reason="cannot be reconstructed for a past date",
-                cache_key_extra="", snapshot=True):
+                cache_key_extra="", snapshot=True, retries=None):
     """Fetch one dataset for one symbol (use "_MARKET" for market-wide data).
 
     live_fn() returns the cleaned data or raises. fake_fn() returns deterministic
     offline data. Successful answers are cached for the day, so a rerun makes no
     network calls. Every answer, good or bad, goes to the snapshot store.
+    retries=0 for transports that already retry once internally (nsepython).
     """
     if ctx.offline:
         data = fake_fn()
@@ -97,7 +98,7 @@ def get_dataset(ctx: Ctx, dataset: str, symbol: str, live_fn, fake_fn,
         if cached is not None:
             return cached
         try:
-            data = with_retry(live_fn)
+            data = with_retry(live_fn, retries=retries)
             res = result("empty" if _is_empty(data) else "ok", data, source="live")
             db.cache_put(ctx.con, key, res)
         except Exception as e:  # noqa: BLE001

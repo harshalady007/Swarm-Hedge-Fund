@@ -150,12 +150,13 @@ def news(sym, day, news_res, extra=None, texts=None):
         items = [f"[{h['published']}] {h['title']} ({h['source']})" for h in news_res["data"]]
     data = {"symbol": sym, "company": config.COMPANY_NAMES.get(sym, sym), "as_of": day,
             "headline_count": len(items),
+            "source_ranking": "exchange filings are primary sources from the company and outrank headlines",
             "headline_status": ("none found in the last %d days (source answered)" % config.NEWS_DAYS
                                 if news_res and news_res.get("status") == "empty" else None),
             "data_gaps": gaps(("headlines", news_res))}
     data = {k: v for k, v in data.items() if v is not None}
     data.update(extra or {})
-    blocks = [{"tag": "headlines", "items": items}] + (texts or [])
+    blocks = (texts or []) + [{"tag": "headlines", "items": items}]
     return {"agent": "news", "data": data, "texts": blocks}
 
 

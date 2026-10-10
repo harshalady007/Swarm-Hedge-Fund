@@ -17,6 +17,13 @@ def checks(ctx, sym):
     yield "google news rss", lambda: data.headlines(ctx, sym)
     yield "yahoo quarterly results", lambda: data.quarterly(ctx, sym)
     yield "yahoo sector indices", lambda: _sector_indices(ctx)
+    import exchange
+    yield "nse announcements", lambda: exchange.announcements(ctx, sym)
+    yield "nse results calendar", lambda: _calendar(ctx, sym)
+    canary = {}
+    yield "nse insider (market canary)", lambda: canary.setdefault("r", exchange.insider_canary(ctx))
+    yield "nse insider (this stock)", lambda: exchange.insider_trades(ctx, sym, canary.get("r"))
+    yield "nse fii/dii", lambda: exchange.fii_dii(ctx)
     yield "telegram (config only)", _telegram
     yield "anthropic key (config)", _anthropic
 
@@ -28,6 +35,15 @@ def _prices(ctx, tickers):
     if missing:
         return {"status": "unavailable", "data": None, "error": f"missing {missing}", "rows": rows}
     return {"status": "ok", "rows": rows, "detail": ", ".join(f"{t}:{len(df)}" for t, df in p.items())}
+
+
+def _calendar(ctx, sym):
+    import exchange
+    import features
+    res = exchange.results_calendar(ctx, sym)
+    if res["status"] != "unavailable":
+        res["detail"] = str(features.earnings_info(res, ctx.day))
+    return res
 
 
 def _sector_indices(ctx):
@@ -67,7 +83,7 @@ def _rows(res):
 def run(sym="RELIANCE"):
     ctx = Ctx(con=db.connect(":memory:"), day=datetime.now(data.IST).date(), offline=False, is_asof=False)
     print(f"doctor: checking live sources for {sym} on {ctx.day_str}\n")
-    print(f"{'source':<26}{'result':<8}{'rows':>7}{'secs':>8}  detail")
+    print(f"{"source":<30}{'result':<8}{'rows':>7}{'secs':>8}  detail")
     print("-" * 100)
     failures = 0
     for name, fn in checks(ctx, sym):
@@ -81,7 +97,7 @@ def run(sym="RELIANCE"):
         label = {"ok": "OK", "empty": "EMPTY", "set": "SET", "not set": "NOT SET"}.get(status, "FAIL")
         failures += label == "FAIL"
         detail = res.get("error") or res.get("detail") or ""
-        print(f"{name:<26}{label:<8}{_rows(res):>7}{secs:>8.1f}  {str(detail)[:120]}")
+        print(f"{name:<30}{label:<8}{_rows(res):>7}{secs:>8.1f}  {str(detail)[:120]}")
     print("\nEMPTY means the source answered with nothing to report; FAIL means it could not be reached "
           "or returned something unusable.")
     return 1 if failures else 0

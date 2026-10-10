@@ -11,6 +11,7 @@ import briefing
 import config
 import data
 import db
+import exchange
 import features
 import indicators
 import journal
@@ -98,16 +99,20 @@ def run(db_path, offline=False, asof=None, llm=None, quiet=False):
                                         sorted(scores, key=lambda s: -scores[s])[:10]))
     print(f"Reviewing: {', '.join(review)}")
 
-    # 7. swarm
+    # 7. fetch per-stock data (shortlist + holdings only), then run the swarm
     m = journal.mark(con, prices, T)
+    market_ds = gather_market(ctx)
+    all_ds = {sym: gather(ctx, sym, market_ds) for sym in review}
+    earnings = {sym: all_ds[sym]["earnings_info"] for sym in review}
     results = []
     for sym in review:
         sector = config.UNIVERSE[sym]
         is_held = sym in held
-        ds = gather(ctx, sym)
-        briefs = build_briefs(ctx, sym, sector, inds[sym], scores[sym], market, ds, prices, benchmarks)
+        ds = all_ds[sym]
+        briefs = build_briefs(ctx, sym, sector, inds[sym], scores[sym], market, ds, prices, benchmarks,
+                              market_ds)
         res = agents.run_swarm(sym, sector, is_held, briefs, llm,
-                               manager_extra_fn=lambda s=sym, d=ds: manager_extra(ctx, s, prices, d))
+                               manager_extra_fn=lambda s=sym: manager_extra(ctx, s, prices, earnings))
         res["datasets"] = ds
         results.append(res)
         if not quiet:
@@ -128,8 +133,7 @@ def run(db_path, offline=False, asof=None, llm=None, quiet=False):
                      sector_counts=sector_counts, nifty_above_200dma=market.get("nifty_above_200dma"))
     decisions = [{"symbol": r["symbol"], "sector": r["sector"], "action": r["action"],
                   "confidence": r["confidence"], "held": r["held"]} for r in results]
-    verdicts = risk.review(decisions, inds, book, earnings={r["symbol"]: r["datasets"].get("earnings_info")
-                                                            for r in results})
+    verdicts = risk.review(decisions, inds, book, earnings=earnings)
 
     # 10. log
     messages, n_buy, n_sell, vetoed = [], 0, 0, []
@@ -171,23 +175,38 @@ def run(db_path, offline=False, asof=None, llm=None, quiet=False):
 
 
 # ------------------------------------------------------------ per-stock data
-def gather(ctx, sym):
+def gather_market(ctx):
+    """Market-wide exchange datasets, fetched once per run."""
+    flows = exchange.fii_dii(ctx)                      # stores today's row in SQLite
+    summary, gaps = features.flow_summary(exchange.stored_flows(ctx.con, ctx.day_str), ctx.day)
+    if flows["status"] == "unavailable":
+        gaps.append(briefing.gap("FII/DII flows today", flows) + " Totals below use stored history only.")
+    return {"fii_dii": flows, "flow_summary": summary, "flow_gaps": gaps,
+            "insider_canary": exchange.insider_canary(ctx)}
+
+
+def gather(ctx, sym, market_ds):
     """Fetch every per-stock dataset. Only called for shortlisted and held stocks."""
-    return {
+    ds = {
         "fundamentals": data.fundamentals(ctx, sym),
         "quarterly": data.quarterly(ctx, sym),
         "headlines": data.headlines(ctx, sym),
+        "announcements": exchange.announcements(ctx, sym),
+        "results_calendar": exchange.results_calendar(ctx, sym),
+        "insider": exchange.insider_trades(ctx, sym, market_ds["insider_canary"]),
     }
+    ds["earnings_info"] = features.earnings_info(ds["results_calendar"], ctx.day)
+    return ds
 
 
-def build_briefs(ctx, sym, sector, ind, screen, market, ds, prices, benchmarks):
+def build_briefs(ctx, sym, sector, ind, screen, market, ds, prices, benchmarks, market_ds):
     T = ctx.day_str
     df = prices[sym]
 
     # technical: indicators + the price series itself
     tech_extra = {"daily_bars": features.compact_bars(df), "weekly_closes": features.weekly_closes(df)}
 
-    # fundamental: snapshot + quarterly trend
+    # fundamental: snapshot + quarterly trend + insider trades
     fund_extra, fund_gaps = {}, []
     q = ds["quarterly"]
     if q["status"] == "ok":
@@ -197,40 +216,79 @@ def build_briefs(ctx, sym, sector, ind, screen, market, ds, prices, benchmarks):
             fund_extra["quarterly"] = table
     else:
         fund_gaps += briefing.gaps(("quarterly results", q)) or ["quarterly results: Yahoo returned none"]
+    ins = ds["insider"]
+    if ins["status"] in ("ok", "empty"):
+        fund_extra["insider"] = features.insider_summary(ins["data"], ctx.day)
+        if ins["status"] == "empty":
+            fund_extra["insider"]["status"] = (f"no insider or promoter trades disclosed in "
+                                               f"{config.INSIDER_DAYS} days (source answered)")
+    else:
+        fund_gaps += briefing.gaps(("insider and promoter trades", ins))
 
-    # macro: market + sector context
+    # news and filings
+    ann = ds["announcements"]
+    filings = [f"[{a['date']}] {a['subject']}: {a['description']} ({a['link']})"
+               for a in (ann["data"] or [])[-config.ANNOUNCEMENTS_SHOWN:]] if ann["status"] == "ok" else []
+    news_extra = {"filing_count": len(filings)}
+    if ann["status"] == "empty":
+        news_extra["filing_status"] = f"no exchange filings in {config.ANNOUNCEMENT_DAYS} days (source answered)"
+    news_gaps = briefing.gaps(("exchange filings", ann))
+
+    # macro: market + sector context + flows
     sector_ctx, sgaps = features.sector_context(sym, sector, prices, benchmarks, prices[config.BENCHMARK])
     macro_extra = {"sector_context": sector_ctx}
+    if market_ds["flow_summary"]:
+        macro_extra["fii_dii"] = market_ds["flow_summary"]
 
     briefs = {
         "technical": briefing.technical(sym, T, ind, screen, tech_extra),
         "fundamental": briefing.fundamental(sym, T, ds["fundamentals"], fund_extra),
-        "news": briefing.news(sym, T, ds["headlines"]),
+        "news": briefing.news(sym, T, ds["headlines"], news_extra,
+                              texts=[{"tag": "exchange_filings", "items": filings}]),
         "macro": briefing.macro(sym, sector, T, market, macro_extra),
     }
     briefs["fundamental"]["data"]["data_gaps"] += fund_gaps
-    briefs["macro"]["data"]["data_gaps"] += sgaps
+    briefs["news"]["data"]["data_gaps"] += news_gaps
+    briefs["macro"]["data"]["data_gaps"] += sgaps + market_ds["flow_gaps"]
     return briefs
 
 
-def manager_extra(ctx, sym, prices, ds):
-    """Portfolio, this stock's history with the desk, and the desk's track record."""
+def manager_extra(ctx, sym, prices, earnings):
+    """Portfolio, results dates, this stock's history with the desk, and the track record."""
     con, T = ctx.con, ctx.day_str
-    out = {"portfolio": journal.portfolio_context(con, prices, T),
+    pf = journal.portfolio_context(con, prices, T)
+    for p in pf["open_positions"]:
+        p["next_results"] = _results_label(earnings.get(p["symbol"]))
+    out = {"portfolio": pf,
+           "results_calendar_this_stock": _results_label(earnings.get(sym)),
            "your_prior_calls_on_this_stock": journal.prior_calls(con, prices, T, sym),
            "recent_track_record": features.track_record(journal.recent_closed(con))}
-    pos = [p for p in out["portfolio"]["open_positions"] if p["symbol"] == sym]
+    soon = [p["symbol"] for p in pf["open_positions"]
+            if (earnings.get(p["symbol"]) or {}).get("status") == "known"
+            and earnings[p["symbol"]]["trading_days_away"] <= config.EARNINGS_BLACKOUT_DAYS]
+    if soon:
+        out["held_stocks_reporting_soon"] = soon
+    pos = [p for p in pf["open_positions"] if p["symbol"] == sym]
     if pos:
         out["this_position"] = pos[0]
     return out
 
 
+def _results_label(info):
+    info = info or {"status": "unknown"}
+    if info["status"] == "known":
+        return f"results on {info['date']} ({info['trading_days_away']} trading day(s) away)"
+    if info["status"] == "none_announced":
+        return "no results date announced on the NSE calendar"
+    return "results date unknown (calendar unavailable)"
+
+
 def source_links(ds):
+    """Newest two exchange filings, then newest two headlines."""
     links = []
-    for key in ("announcements", "headlines"):
-        res = ds.get(key)
-        if res and res.get("status") == "ok":
-            for item in res["data"][:2]:
-                if item.get("link"):
-                    links.append(item["link"])
+    ann, news = ds.get("announcements"), ds.get("headlines")
+    if ann and ann.get("status") == "ok":
+        links += [a["link"] for a in ann["data"][-2:][::-1] if a.get("link")]
+    if news and news.get("status") == "ok":
+        links += [h["link"] for h in news["data"][:2] if h.get("link")]
     return links
